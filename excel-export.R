@@ -148,13 +148,19 @@ calcList <- lapply(calcList, function(x) {
 })
 
 
-calcList <- lapply(calcList, function(x) {
-  x[["dependsOnSheet"]] <- sort(unique(unlist(sapply(calcList[x[["formVars"]]], function(y) y[["sheet"]]))))
-  if (is.null(x[["dependsOnSheet"]]))
-    x[["dependsOnSheet"]] <- x[["sheet"]]
-  x[["dependsOnSheet"]] <- paste0(if (length(x[["dependsOnSheet"]]) > 1) "zzz " else "", paste0(x[["dependsOnSheet"]], collapse = ", "))
-  return(x)
-})
+# Get sheet dependencies. When dependent on several sheets, then move to separat blocks.
+# Repeat until all variables have been moved to the right sheet block.
+oldList <- NULL
+while(!assertthat::are_equal(oldList, calcList)) {
+  oldList <- calcList
+  calcList <- lapply(calcList, function(x) {
+    dependsOnSheet <- sort(unique(unlist(sapply(calcList[x[["formVars"]]], function(y) y[["sheet"]]))))
+    if (is.null(dependsOnSheet))
+      dependsOnSheet <- x[["sheet"]]
+    x[["sheet"]] <- paste0(if (length(dependsOnSheet) > 1) "zzz " else "", paste0(dependsOnSheet, collapse = ", "))
+    return(x)
+  })
+}
 
 #### Apply ordering ####
 
@@ -163,16 +169,16 @@ calcDf <- do.call("rbind", lapply(calcList, function(x) {
   data.frame(x)
 }))
 
-calcDf <- calcDf[order(calcDf[, "dependsOnSheet"], calcDf[, "dropStage"]), ]
+calcDf <- calcDf[order(calcDf[, "sheet"], calcDf[, "dropStage"]), ]
 
 script <- character()
 
 lastSheet <- "wefplxwerplwef"
 for (i in 1:nrow(calcDf)) {
-  if (calcDf[i, "dependsOnSheet"] != lastSheet) {
+  if (calcDf[i, "sheet"] != lastSheet) {
     script[length(script) + 1] <- ""
-    script[length(script) + 1] <- paste0(scriptCommentPrefix, calcDf[i, "dependsOnSheet"])
-    lastSheet <- calcDf[i, "dependsOnSheet"]
+    script[length(script) + 1] <- paste0(scriptCommentPrefix, calcDf[i, "sheet"])
+    lastSheet <- calcDf[i, "sheet"]
   }
   script[length(script) + 1] <- paste0(calcDf[i, "var"], " = ", calcDf[i, "form"])
   if (cellAsCommentAfterLine) {
