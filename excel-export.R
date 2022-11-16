@@ -148,6 +148,14 @@ calcList <- lapply(calcList, function(x) {
 })
 
 
+calcList <- lapply(calcList, function(x) {
+  x[["dependsOnSheet"]] <- sort(unique(unlist(sapply(calcList[x[["formVars"]]], function(y) y[["sheet"]]))))
+  if (is.null(x[["dependsOnSheet"]]))
+    x[["dependsOnSheet"]] <- x[["sheet"]]
+  x[["dependsOnSheet"]] <- paste0(if (length(x[["dependsOnSheet"]]) > 1) "zzz " else "", paste0(x[["dependsOnSheet"]], collapse = ", "))
+  return(x)
+})
+
 #### Apply ordering ####
 
 calcDf <- do.call("rbind", lapply(calcList, function(x) {
@@ -155,20 +163,20 @@ calcDf <- do.call("rbind", lapply(calcList, function(x) {
   data.frame(x)
 }))
 
-calcDf <- calcDf[order(calcDf[, "dropStage"], calcDf[, "sheet"]), ]
+calcDf <- calcDf[order(calcDf[, "dependsOnSheet"], calcDf[, "dropStage"]), ]
 
 script <- character()
 
 lastSheet <- "wefplxwerplwef"
 for (i in 1:nrow(calcDf)) {
-  if (calcDf[i, "sheet"] != lastSheet) {
+  if (calcDf[i, "dependsOnSheet"] != lastSheet) {
     script[length(script) + 1] <- ""
-    script[length(script) + 1] <- paste0(scriptCommentPrefix, calcDf[i, "sheet"])
-    lastSheet <- calcDf[i, "sheet"]
+    script[length(script) + 1] <- paste0(scriptCommentPrefix, calcDf[i, "dependsOnSheet"])
+    lastSheet <- calcDf[i, "dependsOnSheet"]
   }
   script[length(script) + 1] <- paste0(calcDf[i, "var"], " = ", calcDf[i, "form"])
   if (cellAsCommentAfterLine) {
-    script[length(script)] <- paste0(script[length(script)], " ", scriptCommentPrefix, dropSheetFromCell(calcDf[i, "cell"]))
+    script[length(script)] <- paste0(script[length(script)], " ", scriptCommentPrefix, calcDf[i, "cell"])
   }
 }
 
