@@ -20,8 +20,11 @@ varPrefix <- "VAR_"
 
 # Mathematical operators used to split formulas (in order to find variables)
 opRegex <- "\\*|\\-|\\+|/|\\^|=|<|>|%%|\\(| |\\)|\n|,"
-# Words that whould be interpreted as functions, not variables
-functionWords <- c("IF")
+# Words that whould be interpreted as functions, not variables are filtered out before variable detection.
+preVarDetectFuncTransformer <- function(formula) {
+  formula <- gsub("[a-zA-Z0-9_]+\\(", "", formula)
+  return(formula)
+}
 # Funciton to change functions from excel to other language
 functionTransformer <- function(formula) {
   formula <- gsub("IF(", "ifelse(", formula, fixed = TRUE)
@@ -54,8 +57,8 @@ getSheet <- function(cell) {
 getVars <- function(form, keepNumbers = FALSE) {
   if (is.numeric(form))
     return(NULL)
+  form <- preVarDetectFuncTransformer(form)
   vars <- strsplit(form, opRegex)[[1]]
-  vars <- unique(trimws(vars[!vars %in% unique(c("", functionWords))]))
   if (!keepNumbers)
     vars <- vars[!grepl("^[0-9]+$", vars)]
   return(vars)
@@ -229,13 +232,14 @@ for (varName in varCells) {
     sheetList[[sheet]][rowCol$row, rowCol$col]
   })
   form <- unname(form)
+  form <- functionTransformer(form)
+  form <- fullyQualifiedFormula(form, sheet = sheet)
 
   varCellsList1[[length(varCellsList1) + 1]] <- list(
     form = form,
     sheet = sheet,
     name = varName,
     cell = cell)
-  varCellsList1[[length(varCellsList1)]][["form"]] <- fullyQualifiedFormula(form, sheet = sheet)
   varCellsList1[[length(varCellsList1)]] <- as.data.frame(varCellsList1[[length(varCellsList1)]], stringsAsFactors = FALSE)
 }
 if (length(varCellsList1) > 0) {
@@ -264,9 +268,12 @@ if (getVarnamesFromLeftCell) {
         form <- try(XLConnect::getCellFormula(calc, sheet = sheet, row = row, col = col), silent = TRUE)
         if (class(form) %in% "try-error") {
           form <- sheetList[[sheet]][row, col]
+          # Only numeric values are taken, else all characters would be imported as variables as well.
           if (!is.numeric(form))
             next
         }
+        form <- functionTransformer(form)
+        form <- fullyQualifiedFormula(form, sheet = sheet)
         # If there is a name to the left, add this name
         if (col > 1 && !is.na(sheetList[[sheet]][row, col - 1])) {
           name1 <- sheetList[[sheet]][row, col - 1]
@@ -281,11 +288,11 @@ if (getVarnamesFromLeftCell) {
           name <- paste0(varPrefix, varCounter)
           varCounter <- varCounter + 1
         }
-        varCellsList2[[length(varCellsList2) + 1]] <- list(form = form)
-        varCellsList2[[length(varCellsList2)]][["sheet"]] <- sheet
-        varCellsList2[[length(varCellsList2)]][["name"]] <- name
-        varCellsList2[[length(varCellsList2)]][["cell"]] <- paste0(sheet, "!", cellToChar(row = row, col = col, dollar = TRUE))
-        varCellsList2[[length(varCellsList2)]][["form"]] <- fullyQualifiedFormula(form, sheet = sheet)
+        varCellsList2[[length(varCellsList2) + 1]] <- list(
+          form = form,
+          sheet = sheet,
+          name = name,
+          cell = paste0(sheet, "!", cellToChar(row = row, col = col, dollar = TRUE)))
         varCellsList2[[length(varCellsList2)]] <- as.data.frame(varCellsList2[[length(varCellsList2)]], stringsAsFactors = FALSE)
         #names(varCellsList2)[length(varCellsList2)] <- name
       }
