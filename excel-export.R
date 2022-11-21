@@ -17,7 +17,8 @@ addCommentAsComment <- TRUE
 addLeftCellValueAsComment <- TRUE
 # Add content of cell right to variable as comment to script?
 addRightCellValueAsComment <- TRUE
-# If there are no real variable names in the excel sheet, then you can choose to get the variable names from the left cell.
+# If there are no real variable names in the excel sheet, or they are not defined for all cells,
+# then you can choose to get the variable names from the left cell.
 getVarnamesFromLeftCell <- TRUE
 # If no name in the left cell was found, how should the the prefix of the artificial variable name given?
 varPrefix <- "VAR_"
@@ -27,9 +28,9 @@ opRegex <- "\\*|\\-|\\+|/|\\^|=|<|>|%%|\\(| |\\)|\\[|\\]|\n|,"
 
 # Words that whould be interpreted as functions, not variables and therefore are filtered out before variable detection.
 preVarDetectFuncTransformer <- function(formula) {
-  formula <- gsub("[a-zA-Z0-9_]+\\(", "", formula)
-  formula <- gsub("[a-zA-Z0-9_]+\\[", "", formula)
-  formula <- gsub("^TRUE$|^FALSE$", "", formula)
+  formula <- gsub("[a-zA-Z0-9_]+\\(", "", formula) # Function calls
+  formula <- gsub("[a-zA-Z0-9_]+\\[", "", formula) # Accessing matrix/data.frame
+  formula <- gsub("^TRUE$|^FALSE$", "", formula) # Logical values -> Not variables.
   return(formula)
 }
 
@@ -58,7 +59,7 @@ functionTransformer <- function(formula, sheet, wb = NULL) {
         # adding a "X" in the front. Because R will add this automatically to numeric column names.
         searchFor <- searchForOrig
         if (HV == "H" && grepl("^[0-9]+$", searchForOrig))
-           searchFor <- paste0("X", searchForOrig)
+          searchFor <- paste0("X", searchForOrig)
         range <- fullyQualifiedCell(rangeOrig, sheet = sheet)
 
         # If this cell range has never been used before, then save it and add
@@ -91,7 +92,7 @@ functionTransformer <- function(formula, sheet, wb = NULL) {
               return(out)
             })
             scriptBlock <- paste0(
-              "#### pre script block ####\n",
+              "#### pre script block ####\n\n",
               "tryNum <- ", paste0(addFunc, collapse = "\n"),
               "\n")
           }
@@ -823,7 +824,6 @@ if (getVarnamesFromLeftCell) {
           name = name,
           cell = cellToChar(sheet = sheet, row = row, col = col, dollar = TRUE))
         varCellsList2[[length(varCellsList2)]] <- as.data.frame(varCellsList2[[length(varCellsList2)]], stringsAsFactors = FALSE)
-        #names(varCellsList2)[length(varCellsList2)] <- name
       }
     }
   }
@@ -850,14 +850,17 @@ if (getVarnamesFromLeftCell) {
         varCellsList2[, "form"] <- gsub(varCellsList1[i, "cell"], varCellsList1[i, "name"], varCellsList2[, "form"], fixed = TRUE)
       }
       # Drop all variables of which the name was guessed, if that variable was defined as real variable in the workbook
-      kickVars <- intersect(varCellsList2[, "name"], varCellsList1[, "name"])
-      if (length(kickVars) > 0) {
-        .keyValueStore$append("log", paste0("\nThe following variables were discarded because their name was guessed, but there already existed",
-                                            " a variable with that defined name:\n",
-                                            paste0(kickVars, collapse = ", ")))
-        varCellsList2 <- varCellsList2[!varCellsList2[, "name"] %in% kickVars,]
+      kickVars <- (varCellsList2[, "name"] %in% varCellsList1[, "name"] |
+                     varCellsList2[, "cell"] %in% varCellsList1[, "cell"])
+      if (sum(kickVars) > 0) {
+        .keyValueStore$append(
+          "log",
+          paste0("\nThe following variables were discarded because their name was guessed, but there already existed",
+                 " a variable with that defined name or range:\n",
+                 paste0(paste0(varCellsList2[kickVars, "name"], " (", gsub("\\$", "", varCellsList2[kickVars, "cell"]), ")"),
+                        collapse = ", ")))
+        varCellsList2 <- varCellsList2[!kickVars,, drop = FALSE]
       }
-      #varCellsList2 <- varCellsList2[!varCellsList2[, "name"] %in% varCellsList1[, "name"],]
     }
   }
 }
@@ -972,7 +975,6 @@ while(!assertthat::are_equal(oldList, calcList)) {
 # Get sheet dependency ordering. This will be necessary to have the right sheet block ordering in the end.
 sheetOrdering <- do.call("rbind", lapply(calcList, function(x) data.frame(x[c("sheet", "dropStage")])))
 sheetOrdering <- tapply(sheetOrdering[, "dropStage"], sheetOrdering[, "sheet"], max)
-#sheetOrdering[] <- equal.length(x = sheetOrdering, add = "0", where = "beginning")
 
 calcList <- lapply(calcList, function(x) {
   x[["dependsOnSheet"]] <- sort(unique(c(x[["sheet"]], unlist(sapply(calcList[x[["formVars"]]], function(y) y[["sheet"]])))))
@@ -995,7 +997,7 @@ calcDf <- do.call("rbind", lapply(calcList, function(x) {
 calcDf <- calcDf[order(calcDf[, "sheetOrder"], nchar(calcDf[, "dependsOnSheet"]), calcDf[, "dropStage"]), ]
 script <- paste0(
   .keyValueStore$getOrSet("pre_script_block", ""),
-  "\n\n", "#### Script ####")
+  "\n\n", "#### script ####")
 
 lastSheet <- "wefplxwerplwef"
 for (i in 1:nrow(calcDf)) {
@@ -1048,11 +1050,10 @@ writeLines(script, scriptOutFile, useBytes = TRUE)
 if (!is.null(logOutFile) && .keyValueStore$contains("log"))
   writeLines(.keyValueStore$get("log"), logOutFile, useBytes = TRUE)
 
-
 circulars <- findCircularReferences(scriptOutFile)
 if (length(circulars) > 1) {
   print(circulars)
   stop("Circular references found in the script.")
 } else {
-  message("If you alter the script in the future, assure that it does not contain circular references using the function 'findCircularReferences(filename)'.")
+  message("*Success*\nIf you alter the script in the future, assure that it does not contain circular references using the function 'findCircularReferences(filename)'.")
 }
