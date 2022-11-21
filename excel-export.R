@@ -36,7 +36,10 @@ preVarDetectFuncTransformer <- function(formula) {
 # Funciton to change functions from excel to other language
 # formula <- "HLOOKUP(3,$I$6:$L$10,2,FALSE) + HLOOKUP(3,$I$6:$L$10,2,FALSE)"
 functionTransformer <- function(formula, sheet, wb = NULL) {
+  # Add simple transformations here, such as IF -> ifelse, MAX -> max, etc.
   formula <- gsub("IF(", "ifelse(", formula, fixed = TRUE)
+  formula <- gsub("MAX(", "max(", formula, fixed = TRUE)
+  formula <- gsub("MIN(", "min(", formula, fixed = TRUE)
 
   # VLOOKUP and HLOOKUP transformation.
   if (grepl("[VH]LOOKUP+\\(", formula)) {
@@ -124,14 +127,19 @@ functionTransformer <- function(formula, sheet, wb = NULL) {
   return(formula)
 }
 
+
 if (!dir.exists("script-out"))
   dir.create("script-out")
 
+
+
 #### Packages ####
+
 if (!"XLConnect" %in% .packages(all.available = TRUE))
   install.packages("XLConnect")
 
 #### Functions ####
+
 # Prerequisite constants for functions
 colCharNumbMapping <- c(LETTERS, paste0(LETTERS[1], LETTERS), paste0(LETTERS[2], LETTERS), paste0(LETTERS[3], LETTERS), paste0(LETTERS[4], LETTERS), paste0(LETTERS[5], LETTERS))
 colCharNumbMapping <- data.frame(char = colCharNumbMapping, num = 1:length(colCharNumbMapping), stringsAsFactors = FALSE)
@@ -388,6 +396,303 @@ equal.length <- function(x, add=0, where=c("beginning","end"), minlength=0, marg
     for(i in sort(unique(n.add))) x.new[n.add==i] <- paste0(x[n.add==i], paste0(rep(add,i),collapse="") )
   }
   return(x.new)
+}
+
+
+#### Functions for circular references
+#' @export
+#' @title Find circular references
+#' @description Finds circular references in an expression.
+#' @author Daniel Hoop
+#' @param expr The expression that should be evaluated. Must be quoted like \code{expr = quote({ a <- 1; b <- 2 })}
+#' @param assignOp The assignment operator which assigns the values of the right hand side (RHS) to the left hand side (LHS). A character vector of any length, e.g. c("<-", "=")
+#' @param filterPatternFunction A function to filter the parts of a line. Consider a line \code{b <- a * foo(b/a)}.\cr
+#' The function \code{foo} might take the value of \code{b} from somewhere else, thus you don't want this to be identified as a circular reference.\cr
+#' In this case, specify \code{filterPatternFunction} as follows: \code{filterPatternFunction = function(x) return(x[!startsWith(x, 'foo(')]))}
+#' @return \code{NULL}, if no circular references are found, otherwise the lines of the expression that contain circular references.
+#' @examples expr <- quote({ a <- b; b <- c; c <- a })
+#' findCircularReferences(expr)
+#' # [1] "a <- b" "b <- c" "c <- a"
+#'
+#' findCircularReferences(quote({ a <- if (a == 1) a + 1 else b }))
+#' # [1] "a <- if (a == 1) a + 1 else b"
+#'
+#' findCircularReferences(quote({ a <- if (a == 1) 2 else a + b }))
+#' # [1] "a <- if (a == 1) 2 else a + b"
+#'
+#' expr <- quote({
+#'   a <- 1
+#'   z <- 9
+#'   b <- 2
+#'   if (a == 1) y <- z else if (b == 1) a <- 1 else x <- z
+#'   d <- 3
+#'   z <- y
+#' })
+#' findCircularReferences(expr)
+#' [1] "z <- 9" "y <- z" "z <- y"
+#'
+#' findCircularReferences(quote({ a <- b; c <- d }))
+#' # NULL
+#'
+#' findCircularReferences(quote({ a <- if (a == 1) 2 else b }))
+#' # NULL
+findCircularReferences <- function (expr, assignOp=c("<-", "="), filterPatternFunction=function(x) return(x[!grepl("^(lookup|if) *\\(", x)])) {
+
+  if (file.exists(expr)) {
+    expr <- readLines(expr, encoding = "UTF-8")
+    expr <- eval(parse(text = paste0("quote({", paste0(expr, collapse = "\n"), "\n})")))
+  }
+  expr <- .prepareExpression(expr, "expr")
+  if (is.null(expr)) # This happens when an empty expression is given.
+    return (NULL)
+
+  # Split multiline if else statements like "if (a == b) c <- 1 else b <- 2"
+  assignOpRegex <- paste0(escapeStr(assignOp), collapse = "|")
+  expr <- unlist(apply(matrix(expr), 1, function(expr) {
+    if (!(grepl("^if( |\\()", expr) && grepl(assignOpRegex, expr)))
+      return (expr)
+    expr <- .splitExceptInBracket(expr, splitIfElseOnly = TRUE)
+    expr <- gsub("^if *\\(.*", "", expr)
+    return(expr[expr != ""])
+  }))
+
+  # Convert multiple assignments per line to one assignment per line each.
+  notAroundOperator <- if ("=" %in% assignOp) c("<", ">", "!", "=") else NULL
+  expr0 <- unlist(mapply(
+    expr = as.list(expr),
+    splitted = lapply(as.list(expr), .splitExceptInBracket, operators = assignOp, ifIsAnOperator = FALSE, notAroundOperator = notAroundOperator),
+    function (expr, splitted) {
+      splitted <- trimws(splitted)
+      if (length(splitted) > 2)
+        return (rev(paste(c(splitted[-length(splitted)]), c(splitted[-1]), sep = paste0(" ", assignOp[1], " "))))
+      return (expr)
+    }))
+
+  # Split again by assignment operator.
+  expr1 <- lapply(expr0, .splitExceptInBracket, operators = assignOp, ifIsAnOperator = FALSE, notAroundOperator = notAroundOperator)
+
+  # The next step splits each entry in expr1 accoding to the assignment operator. Then, right hand side will be split by operators
+  # An entry in a list could look like this, where the original line in expression was z <- b + a
+  #  list(list("z"), list(c("b","a")))
+  errorMsg <- tryCatch({
+    expr1 <- lapply(expr1, function (x) {
+      if (length(x) == 1)
+        return (NULL)
+      if (length(x) > 2) {
+        stop (paste0("Each row in the expression must contain maximally one assignment operator '", paste0(assignOp, collapse = "/"), "'. E.g.: a ", assignOp[1], " b.\n",
+                     "An erroneouss row looks something like: ", paste0(x, collapse=paste0(" ", assignOp[1]," "))))
+      }
+      # Split outside of brackets
+      res <- .splitExceptInBracket(as.list(x))
+      if (length(res[[1]]) > 1)
+        stop (paste0("Assigning to a LHS expression `a + b <- c` is not alloed.\n",
+                     "An erroneouss row looks something like: ", paste0(x, collapse=paste0(" ", assignOp[1]," "))))
+      if (!is.null(filterPatternFunction))
+        res <- lapply(res, filterPatternFunction)
+      # Now split completely all vars
+      res[[2]] <- .splitAll(res[[2]], ignoreLhsAssignment = TRUE)
+      if (!is.null(filterPatternFunction))
+        res <- lapply(res, filterPatternFunction)
+      res <- lapply(res, function (x) x[x!=""] )
+      return (res)
+    })
+    "" # return
+  }, error = function (e) return (e$message))
+  if (errorMsg != "")
+    return (errorMsg)
+
+  expr0 <- expr0[!sapply(expr1, is.null)]
+  expr1 <- expr1[!sapply(expr1, is.null)]
+
+  # For each entry in left hand side (lhs), check if it appears in any right hand side (rhs).
+  # If not, then delete from list, and carry on, as long as there are changes.
+  # If there are no changes anymore, but the list is not empty, then there are circulars. If the list is empty in the end, everything is fine.
+  while (TRUE) {
+    lengthOld <- sum(!sapply(expr1, is.null))
+    allx2 <- unlist(lapply(expr1, function(x)x[[2]]))
+    expr1 <- lapply(expr1, function (x) {
+      if (length(x) == 0)
+        return (NULL)
+      if (!x[[1]] %in% allx2)
+        return (NULL)
+      return (x)
+    })
+    lengthNew <- sum(!sapply(expr1, is.null))
+    if (lengthNew == 0 | lengthNew == lengthOld)
+      break
+  }
+  if (lengthNew > 0)
+    return (expr0[!sapply(expr1, is.null)])
+  return (NULL)
+}
+
+if (FALSE) {
+  exprTest <- expression({
+    a <- lookup(z)
+    z <- b + a # z
+    a <- b
+    c <- b
+    d <- c; b <- d
+  })
+  cat(paste0(findCircularReferences(exprTest), collapse="\n"))
+}
+
+#' @keywords internal
+#' @author Daniel Hoop
+.prepareExpression <- function (expr, argName) {
+  if (is.expression(expr))
+    stop (paste0("The argument '", argName, "' must not be an expression but quoted. Use something along the lines of:\n", argName, " = quote({\n  a <- 1\n  b <- 2\n})"))
+  expr0 <- as.character(expr)
+  expr0 <- if (length(expr0) > 0 && expr0[1] == "{") expr0[-1] else expr0
+  expr0 <- if (length(expr0) > 0 && expr0[length(expr0)] == "}") expr0[-length(expr0)] else expr0
+  # The next step is necessary, because inside if statements if(a == b) { a <- 1; b <- 2 }, "\n" characters are included, but these lines will not be in seperate vector places.
+  expr0 <- unlist(strsplit(expr0, "\n"))
+  expr0 <- expr0[expr0 != ""]
+  return (expr0)
+}
+
+#' Escapes characters that have special meaning in regular expressions with backslashes.
+#' @keywords internal
+#' @author Daniel Hoop
+#' @param x Character vector containing the strings that should be escaped.
+#' @examples
+#' escapeStr(c("asdf.asdf", ".asdf", "\\.asdf", "asdf\\.asdf") )
+escapeStr <- function(x) {
+  if (!is.character(x))
+    stop("x must be a character vector.")
+  regChars <- c(".","|","(",")","[","]","{","}","^","$","*","+","-","?")
+  res <- apply(matrix(x), 1, function(y) {
+    if (nchar(y)==1 && y%in%regChars)
+      return (paste0("\\", y))
+    for (i in nchar(y):2) {
+      if ( substr(y, i-1, i-1) != "\\" && substr(y, i, i) %in% regChars )
+        y <- paste0(substr(y, 1, i-1), "\\", substr(y, i, nchar(y)))
+    }
+    if (substring(y, 1, 1) %in% regChars)
+      y <- paste0("\\", y)
+    return (y)
+  })
+  return (res)
+}
+
+#' Splits an expression where operators occur, but not inside brackets.
+#' @keywords internal
+#' @author Daniel Hoop
+#' @examples
+#' .splitExceptInBracket("(a+b+c)+1++1+")
+#' [1] "(a+b+c)" "1"       ""        "1"
+#' .splitExceptInBracket("a+b", splitIfElseOnly=TRUE)
+#' [1] "a+b"
+#' .splitExceptInBracket("1 <- if (a == b) c else d", splitIfElseOnly=TRUE)
+#' [1] "1 <- if (a == b)" "c"                "d"
+#' .splitExceptInBracket(c("a = b+b", "a <-b+b"), operators = c("=", "<-"))
+#' [[1]]
+#' [1] "a"   "b+b"
+#' [[2]]
+#' [1] "a"   "b+b"
+#' .splitExceptInBracket("a <= b", operators = c("<-", "="), notAroundOperator = c("<", ">", "!", "="))
+.splitExceptInBracket <- function (txt,
+                                   operators = NULL,
+                                   notAroundOperator = NULL,
+                                   ifIsAnOperator = TRUE,
+                                   splitIfElseOnly = FALSE) {
+
+  if (length(txt)>1)
+    return (lapply(as.list(txt), .splitExceptInBracket,
+                   operators = operators,
+                   notAroundOperator = notAroundOperator,
+                   ifIsAnOperator = ifIsAnOperator,
+                   splitIfElseOnly = splitIfElseOnly))
+
+  if (length(txt) == 0 || txt == "")
+    return (txt)
+  if (splitIfElseOnly) {
+    op <- "else"
+  } else {
+    if (is.null(operators)) {
+      op <- c("*", "-", "+", "/", "^", "=", "!", "<", ">", "%%", "} else {", "}else{", "} else ", " else ")
+      opRegex <- "\\*|\\-|\\+|/|\\^|=|<|>|%%|(\n| |\\})+else(\\{| |\n)+"
+    } else {
+      op <- operators
+      opRegex <- paste0(escapeStr(operators), collapse = "|")
+    }
+    if (is.null(notAroundOperator) && !grepl("\\(|\\)|\\[|\\]", txt))
+      return (trimws(strsplit(txt, opRegex)[[1]]))
+  }
+
+  bBal <- 0 # Bracket balance
+  parts <- character() # Splitted result
+  lastSplit <- 1 # Index of last splitted operator
+  hasIfOccured <- hasIfBracketOpened <- hasIfBracketClosed <- FALSE
+  rest <- txt
+  for(i in 1:nchar(txt)) {
+    st <- substr(txt, i, i)
+    restMin1 <- rest
+    rest <- substring(txt, i)
+    if (st == "(" || st == "[") bBal <- bBal + 1
+    if (st == ")" || st == "]") bBal <- bBal - 1
+    if (hasIfOccured && bBal == 1)
+      hasIfBracketOpened <- TRUE
+    if (bBal == 0) {
+      hasIfOccured <- ifIsAnOperator && (hasIfOccured || grepl("if( |\n)*\\(", rest))
+      if (hasIfBracketOpened)
+        hasIfBracketClosed <- TRUE
+      if (hasIfBracketClosed) {
+        hasIfOccured <- hasIfBracketOpened <- hasIfBracketClosed <- FALSE
+        parts <- c(parts, substr(txt, lastSplit, i))
+        lastSplit <- i+1
+      } else {
+        # Normal case without if
+        if (!is.null(notAroundOperator)) {
+          opFound <- which(sapply(op, function (op) {
+            foundTmp <- startsWith(rest, op)
+            return (foundTmp
+                    && !any(sapply(notAroundOperator,
+                                   function(notOp) {
+                                     startsWith(restMin1, notOp) ||
+                                       startsWith(substring(rest, 2), notOp)
+                                   })))
+          }))
+        } else {
+          opFound <- which(sapply(op, function (op) startsWith(rest, op)))
+        }
+        if (length(opFound) > 0) {
+          parts <- c(parts, substr(txt, lastSplit, i-1))
+          lastSplit <- i + nchar(op[opFound]) # i+1
+        }
+      }
+    }
+  }
+  if (lastSplit != i+1)
+    parts <- c(parts, substr(txt, lastSplit, i))
+  return (trimws(parts))
+}
+
+#' @keywords internal
+#' @author Daniel Hoop
+.splitAll <- function (txt, killFunctionCalls = TRUE, ignoreLhsAssignment = FALSE) {
+  # Helper function for function 'findCircularReferences'
+  if (length(txt) > 1)
+    return (unlist(lapply(txt, .splitAll, ignoreLhsAssignment = ignoreLhsAssignment)))
+  if (length(txt) == 0 || txt == "")
+    return (txt)
+  # Kill function calls
+  if (killFunctionCalls)
+    txt <- gsub("[a-zA-Z.][a-zA-Z0-9_]? *\\(", "", txt)
+  if (ignoreLhsAssignment) {
+    txt <- unlist(strsplit(txt, "\\*|\\+|/|\\^|%%|\\(|\\)|\\[|\\]|>|<=|==|=>|!=")) # Split everything except assignments
+    txt <- unlist(strsplit(txt, "(?<!<)\\-", perl = TRUE)) # Negative lookbehind: "-" that is not preceeded by "<"
+    txt <- unlist(strsplit(txt, "<(?!\\-)", perl = TRUE)) # Negative lookahead: "<" that is not followed by "-"
+    # If there is an assignment in a verctor place, then take the right hand side.
+    txt <- unlist(lapply(strsplit(txt, "<\\-|="), function (x) {
+      if (length(x) == 2)
+        return (x[2])
+      return (x)
+    }))
+    return (trimws(txt))
+  }
+  opRegex <- "\\*|\\-|\\+|/|\\^|=|<|>|%%"
+  return (trimws(unlist(strsplit(txt, opRegex))))
 }
 
 #### Load sheets ####
@@ -744,3 +1049,10 @@ if (!is.null(logOutFile) && .keyValueStore$contains("log"))
   writeLines(.keyValueStore$get("log"), logOutFile, useBytes = TRUE)
 
 
+circulars <- findCircularReferences(scriptOutFile)
+if (length(circulars) > 1) {
+  print(circulars)
+  stop("Circular references found in the script.")
+} else {
+  message("If you alter the script in the future, assure that it does not contain circular references using the function 'findCircularReferences(filename)'.")
+}
