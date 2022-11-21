@@ -3,7 +3,10 @@
 excelInFile <- "excel-in/calculations.xlsx"
 scriptOutFile <- "script-out/script.R"
 lookupTableOutDir <- "script-out"
+logOutFile <- "script-out/log.txt"
 
+# Skip sheet with this pattern
+skipSheetPattern <- "^lookup_"
 # Comment character for the script that will be created
 scriptCommentPrefix <- "# "
 # Add cell in which the variable was defined as comment to script?
@@ -21,12 +24,15 @@ varPrefix <- "VAR_"
 
 # Mathematical operators used to split formulas (in order to find variables)
 opRegex <- "\\*|\\-|\\+|/|\\^|=|<|>|%%|\\(| |\\)|\\[|\\]|\n|,"
-# Words that whould be interpreted as functions, not variables are filtered out before variable detection.
+
+# Words that whould be interpreted as functions, not variables and therefore are filtered out before variable detection.
 preVarDetectFuncTransformer <- function(formula) {
   formula <- gsub("[a-zA-Z0-9_]+\\(", "", formula)
   formula <- gsub("[a-zA-Z0-9_]+\\[", "", formula)
+  formula <- gsub("^TRUE$|^FALSE$", "", formula)
   return(formula)
 }
+
 # Funciton to change functions from excel to other language
 # formula <- "HLOOKUP(3,$I$6:$L$10,2,FALSE) + HLOOKUP(3,$I$6:$L$10,2,FALSE)"
 functionTransformer <- function(formula, sheet, wb = NULL) {
@@ -36,6 +42,7 @@ functionTransformer <- function(formula, sheet, wb = NULL) {
   if (grepl("[VH]LOOKUP+\\(", formula)) {
     for (i in (nchar(formula)-nchar("HLOOKUP")):1) {
       if (substr(formula, i, i + 7) %in% c("HLOOKUP(", "VLOOKUP(")) {
+        # Split up the arguments in call to the lookup function.
         HV <- substr(formula, i, i)
         form1 <- substring(formula, i + 8, nchar(formula))
         formSplit <- strsplit(form1, ",")[[1]]
@@ -44,20 +51,28 @@ functionTransformer <- function(formula, sheet, wb = NULL) {
         takeWhich <- as.numeric(formSplit[3])
         exactMatch <- strsplit(formSplit[4], "\\)")[[1]][1]
 
+        # When a column lookup is needed and the search key is numeric, it has to be converted by
+        # adding a "X" in the front. Because R will add this automatically to numeric column names.
         searchFor <- searchForOrig
         if (HV == "H" && grepl("^[0-9]+$", searchForOrig))
            searchFor <- paste0("X", searchForOrig)
         range <- fullyQualifiedCell(rangeOrig, sheet = sheet)
 
+        # If this cell range has never been used before, then save it and add
+        # it to pre script block where the lookup table will be read in.
         fileOrObj <- paste0(HV, "_", gsub("[^a-zA-Z0-9_]", "_", gsub("$", "", range, fixed = TRUE)))
         .keyValueStore$getOrSet("lookup_tables", list())
-        if (!range %in% names(.keyValueStore$get("lookup_tables"))) {
+        if (!fileOrObj %in% names(.keyValueStore$get("lookup_tables"))) {
+          # Add to lookup ranges. Variables that are contained in these, are kicked later.
+          .keyValueStore$append("lookup_ranges", expandRange(range))
+          # Lookup table preparations and saving.
           tabList <- .keyValueStore$get("lookup_tables")
           filePath <- paste0(lookupTableOutDir, "/", fileOrObj, ".csv")
-          tabList[[paste0(HV, "_", range)]] <- list(
+          tabList[[fileOrObj]] <- list(
             range = range,
             file = filePath
           )
+          .keyValueStore$set("lookup_tables", tabList)
           saveRegionToFile(wb = wb, range = range, file = filePath)
 
           # If the script block is empty, add a function to make values numeric, if possible.
@@ -74,7 +89,8 @@ functionTransformer <- function(formula, sheet, wb = NULL) {
             })
             scriptBlock <- paste0(
               "#### pre script block ####\n",
-              "tryNum <- ", paste0(addFunc, collapse = "\n"))
+              "tryNum <- ", paste0(addFunc, collapse = "\n"),
+              "\n")
           }
 
           if (HV == "H") {
@@ -89,13 +105,16 @@ functionTransformer <- function(formula, sheet, wb = NULL) {
 
         }
 
-        # In the formula, replace the lookup with a read out from a matrix.
-        formula <-
-          gsub(
-            paste0(HV, "LOOKUP(", searchForOrig, ",", rangeOrig, ",", takeWhich, ",", exactMatch, ")"),
-            paste0("tryNum(", fileOrObj, if (HV == "H") paste0('[', takeWhich-1, ',"', searchFor, '"]') else paste0('["', searchFor, '", ', takeWhich-1, ']'), ")")
-            , formula, fixed = TRUE
-          )
+        # In the formula, replace the lookup with a read out from a matrix.¨
+        if (isNum(searchFor) || searchForOrig != searchFor)
+          searchFor <- paste0('"', searchFor, '"')
+        lookupSearch <- paste0(HV, "LOOKUP(", searchForOrig, ",", rangeOrig, ",", takeWhich, ",", exactMatch, ")")
+        lookupReplace <- paste0("tryNum(", fileOrObj, if (HV == "H") paste0('[', takeWhich-1, ',', searchFor, ']') else paste0('[', searchFor, ', ', takeWhich-1, ']'), ")")
+        formulaOrig <- formula
+        formula <- gsub(lookupSearch, lookupReplace, formula, fixed = TRUE)
+        #if (searchFor == "r_") browser()
+        if (formula == formulaOrig)
+          warning("Conversion of VLOOKUP/HLOOKUP (SVERWEIS/WVERWEIS) has probably not worked for: ", lookupSearch)
         # In case double quotes have been produced, reduce them to single ones.
         formula <- gsub('"+', '"', formula)
       }
@@ -104,27 +123,6 @@ functionTransformer <- function(formula, sheet, wb = NULL) {
 
   return(formula)
 }
-
-# region = "calculations1!$I$6:$L$10"; file = "script-out/H_calculations1-I6-L10.csv"
-saveRegionToFile <- function(wb, range, file) {
-  if (!grepl("!", range))
-    stop("Region name is not fully qualified.")
-  range <- strsplit(range, "!")[[1]]
-  sheet <- range[1]
-  range <- range[2]
-  range <- strsplit(range, ":")[[1]]
-  if (length(range) != 2)
-    stop("Not a range given in `region`.")
-  rowColStart <- getRowCol(range[1])
-  rowColStopp <- getRowCol(range[2])
-
-  out <- XLConnect::readWorksheet(wb, sheet = sheet, startRow = rowColStart$row, startCol = rowColStart$col,
-                           endRow = rowColStopp$row, endCol = rowColStopp$col,
-                           autofitRow = FALSE, autofitCol = FALSE, header = FALSE)
-
-  write.table(out, file=file, sep = ";", eol = "\n", quote=FALSE, col.names=FALSE, row.names=FALSE) # KEINE Colnames oder Rownames
-}
-
 
 if (!dir.exists("script-out"))
   dir.create("script-out")
@@ -164,6 +162,11 @@ rownames(colNumbCharMapping) <- colNumbCharMapping[, "num"]
   ,remove = function(key) {
     if (.keyValueStore$contains(key))
       base::rm(list = key, envir = .keyValueStoreEnvir)
+  }
+  ,append = function(key, value) {
+    if (!.keyValueStore$contains(key))
+      return (.keyValueStore$set(key, value))
+    invisible(.keyValueStore$set(key, c(.keyValueStore$get(key), value)))
   }
 )
 
@@ -207,7 +210,7 @@ getRowCol <- function(cell) {
 }
 
 # cellToChar(1, 1, TRUE)
-cellToChar <- function(row, col, dollar = TRUE) {
+cellToChar <- function(sheet = NULL, row, col, dollar = TRUE) {
   if (is.na(colNumbCharMapping[col, "char"]))
     stop("Cannot convert to character-like cell identifiert.")
   col <-colNumbCharMapping[col, "char"]
@@ -215,7 +218,9 @@ cellToChar <- function(row, col, dollar = TRUE) {
     col <- paste0("$", col)
     row <- paste0("$", row)
   }
-  return(paste0(col, row))
+  if (!is.null(sheet))
+    sheet <- paste0(sheet, "!")
+  return(paste0(sheet, col, row))
 }
 
 # fullyQualifiedCell(c("A1", 1), "sheet1")
@@ -240,6 +245,13 @@ fullyQualifiedCell <- function(cell, sheet) {
   return(cell)
 }
 
+# isCellNotVariable(cell = c("asdf12", "sheet!$A$1", "BB99"))
+isCellNotVariable <- function(cell) {
+  if (length(cell) == 0)
+    return(cell)
+  return(grepl("!|\\$", cell) | grepl("^[A-Z]+[0-9]+$", cell))
+}
+
 # fullyQualifiedFormula("A1+1", "sheet1")
 fullyQualifiedFormula <- function(form, sheet) {
   if (!grepl("[A-Z]+[0-9]+", form))
@@ -261,6 +273,32 @@ sanitizeCellName <- function(cell, dropSheet = FALSE) {
   }
   cell <- gsub("$", "", cell, fixed = TRUE)
   return(cell)
+}
+
+# expandRange("calculations1!$I$6:$L$10")
+expandRange <- function(range) {
+  sheet <- ""
+
+  if (grepl("!", range)) {
+    range <- strsplit(range, "!")[[1]]
+    sheet <- range[1]
+    rest <- range[2]
+  } else {
+    rest <- range
+  }
+  rest <- strsplit(rest, ":")[[1]]
+
+  if (length(rest) == 1)
+    return(fullyQualifiedCell(rest, sheet))
+  col <- gsub("\\$|[0-9]*", "", rest)
+  row <- as.numeric(gsub("\\$|[A-Z]*", "", rest))
+  col <- try(colCharNumbMapping[which(colCharNumbMapping[, "char"] == col[1]):which(colCharNumbMapping[, "char"] == col[2]) , "char"])
+  if (class(col) == "try-error")
+    stop("Expansion of column range did not work. Probably the `colCharNumbMapping` has to be expanded.")
+  row <- row[1]:row[2]
+  allRowCol <- expand.grid(col, row)
+  out <- paste0(if (sheet != "") paste0(sheet, "!"), "$", allRowCol[, 1], "$", allRowCol[, 2])
+  return(out)
 }
 
 # Extract all comments form an Excel Workbook
@@ -297,6 +335,31 @@ extractAllComments <- function(file) {
   comments <- do.call("rbind", comments)
   rownames(comments) <- comments[, "sheet_cell"]
   return(comments)
+}
+
+# region = "calculations1!$I$6:$L$10"; file = "script-out/H_calculations1-I6-L10.csv"
+saveRegionToFile <- function(wb, range, file) {
+  if (!grepl("!", range))
+    stop("Region name is not fully qualified.")
+  range <- strsplit(range, "!")[[1]]
+  sheet <- range[1]
+  range <- range[2]
+  range <- strsplit(range, ":")[[1]]
+  if (length(range) != 2)
+    stop("Not a range given in `region`.")
+  rowColStart <- getRowCol(range[1])
+  rowColStopp <- getRowCol(range[2])
+
+  out <- XLConnect::readWorksheet(wb, sheet = sheet, startRow = rowColStart$row, startCol = rowColStart$col,
+                                  endRow = rowColStopp$row, endCol = rowColStopp$col,
+                                  autofitRow = FALSE, autofitCol = FALSE, header = FALSE)
+
+  write.table(out, file=file, sep = ";", eol = "\n", quote=FALSE, col.names=FALSE, row.names=FALSE) # KEINE Colnames oder Rownames
+}
+
+# Is kind of numeric or can be coerced to.
+isNum <- function(x) {
+  !is.na(suppressWarnings(as.numeric(x)))
 }
 
 #' Make all entires in vector the same length.
@@ -339,6 +402,7 @@ sheetList <- list()
 varCellsList1 <- list()
 varCellsList2 <- list()
 varCounter <- 1
+invisible(.keyValueStore$setAndReturn("lookup_ranges", NULL))
 
 varCells <- XLConnect::getDefinedNames(calc)
 dupl <- varCells[duplicated(varCells)]
@@ -349,6 +413,10 @@ if (length(dupl) > 0)
 for (varName in varCells) {
   cell <- unname(XLConnect::getReferenceFormula(calc, varName))
   sheet <- getSheet(cell)
+  if (!is.null(skipSheetPattern) && grepl(skipSheetPattern, sheet)) {
+    .keyValueStore$append("log", paste0('\nSheet "', sheet, '" excluded by `skipSheetPattern`: "', skipSheetPattern, '".'))
+    next
+  }
   if (!sheet %in% names(sheetList)) {
     sheetList[[sheet]] <-
       XLConnect::readWorksheet(calc, sheet = sheet, startRow = 1, startCol = 1, autofitRow = FALSE, autofitCol = FALSE, header = FALSE)
@@ -384,6 +452,10 @@ rm(varCells)
 
 if (getVarnamesFromLeftCell) {
   for (sheet in XLConnect::getSheets(calc)) {
+    if (!is.null(skipSheetPattern) && grepl(skipSheetPattern, sheet)) {
+      .keyValueStore$append("log", paste0('\nSheet "', sheet, '" excluded by `skipSheetPattern`: "', skipSheetPattern, '".'))
+      next
+    }
     if (!sheet %in% names(sheetList)) {
       sheetList[[sheet]] <-
         XLConnect::readWorksheet(calc, sheet = sheet, startRow = 1, startCol = 1, autofitRow = FALSE, autofitCol = FALSE, header = FALSE)
@@ -392,13 +464,16 @@ if (getVarnamesFromLeftCell) {
     # Loop through all cells of sheet
     for (row in 1:nrow(calcDat)) {
       for (col in 1:ncol(calcDat)) {
+
         if (is.na(calcDat[row, col]))
           next
         form <- try(XLConnect::getCellFormula(calc, sheet = sheet, row = row, col = col), silent = TRUE)
+
         if (class(form) %in% "try-error") {
           form <- sheetList[[sheet]][row, col]
           # Only numeric values are taken, else all characters would be imported as variables as well.
-          if (!is.numeric(form))
+          form <- suppressWarnings(as.numeric(form))
+          if (is.na(form))
             next
         }
         form <- functionTransformer(form, sheet = sheet, wb = calc)
@@ -414,11 +489,15 @@ if (getVarnamesFromLeftCell) {
             isTrue <- try(grepl("^[0-9]+$", sheetList[[sheet]][row, col + 1]), silent = TRUE)
             if (class(isTrue) == "try-error" || length(isTrue) == 0)
               return(FALSE)
-            TRUE
+            return(isTrue)
           })
-          if (leftIsNumber || (leftIsEmpty && rightIsNumber))
+          if (leftIsNumber) { # || (leftIsEmpty && rightIsNumber)) {
+            cell <- cellToChar(sheet = sheet, row = row, col = col, dollar = FALSE)
+            .keyValueStore$append("log", paste0(cell, ": Discarded. Cell to left is number -> Table, not variable.")) # `leftIsNumber || (leftIsEmpty && rightIsNumber)`"))
             next
+          }
         }
+
         # If there is a name to the left, add this name
         if (col > 1 && !is.na(sheetList[[sheet]][row, col - 1])) {
           name1 <- sheetList[[sheet]][row, col - 1]
@@ -437,7 +516,7 @@ if (getVarnamesFromLeftCell) {
           form = form,
           sheet = sheet,
           name = name,
-          cell = paste0(sheet, "!", cellToChar(row = row, col = col, dollar = TRUE)))
+          cell = cellToChar(sheet = sheet, row = row, col = col, dollar = TRUE))
         varCellsList2[[length(varCellsList2)]] <- as.data.frame(varCellsList2[[length(varCellsList2)]], stringsAsFactors = FALSE)
         #names(varCellsList2)[length(varCellsList2)] <- name
       }
@@ -466,13 +545,28 @@ if (getVarnamesFromLeftCell) {
         varCellsList2[, "form"] <- gsub(varCellsList1[i, "cell"], varCellsList1[i, "name"], varCellsList2[, "form"], fixed = TRUE)
       }
       # Drop all variables of which the name was guessed, if that variable was defined as real variable in the workbook
-      varCellsList2 <- varCellsList2[!varCellsList2[, "name"] %in% varCellsList1[, "name"],]
+      kickVars <- intersect(varCellsList2[, "name"], varCellsList1[, "name"])
+      if (length(kickVars) > 0) {
+        .keyValueStore$append("log", paste0("\nThe following variables were discarded because their name was guessed, but there already existed",
+                                            " a variable with that defined name:\n",
+                                            paste0(kickVars, collapse = ", ")))
+        varCellsList2 <- varCellsList2[!varCellsList2[, "name"] %in% kickVars,]
+      }
+      #varCellsList2 <- varCellsList2[!varCellsList2[, "name"] %in% varCellsList1[, "name"],]
     }
   }
 }
 
 #### Combine variables of which the names were defined and guessed ####
 varCellsList <- rbind(varCellsList1, varCellsList2)
+
+kickCells <- intersect(varCellsList[, "cell"], .keyValueStore$get("lookup_ranges"))
+if (length(kickCells) > 0) {
+  .keyValueStore$append("log", paste0("\nThe following cells were not considered a variable because they were part of lookup tables:\n",
+                                      paste0(gsub("\\$", "", kickCells), collapse = ", "), "\n"))
+  varCellsList <- varCellsList[!varCellsList[, "cell"] %in% kickCells, ]
+}
+
 if (nrow(varCellsList) == 0)
   stop("No variables found.")
 
@@ -498,9 +592,17 @@ for (varName in rownames(varCellsList)) {
     form = varCellsList[varName, "form"],
     formVars = getVars(varCellsList[varName, "form"])
   )
+  calcList[[length(calcList)]][["formVarsPasted"]] <- paste0(calcList[[length(calcList)]][["formVars"]], collapse = ",")
 }
 
 names(calcList) <- rownames(varCellsList)
+
+notVariableConverted <- lapply(calcList, function(x) if(any(isCellNotVariable(x[["formVars"]]))) return(x[!names(x) %in% "formVars"]) else return(NULL))
+notVariableConverted <- notVariableConverted[!sapply(notVariableConverted, is.null)]
+if (length(notVariableConverted) > 0) {
+  print(do.call("rbind", notVariableConverted))
+  stop("The transformation of some cells into variables did not work. See printed output above. Problematic cells are found in columns 'form' and 'formVarsPasted'.")
+}
 
 #### Find out correct ordering ####
 calcList2 <- calcList
@@ -528,8 +630,11 @@ while(length(calcList2) > 0) {
   if (length(calcList2) == 1)
     break()
 
-  if (length(calcList2) == lengthList) { # length(calcList2) != 1
-    print(calcList2)
+  if (length(calcList2) == lengthList || nRuns >= 100000) { # length(calcList2) != 1
+    print(do.call("rbind", lapply(calcList2, function(x) {
+      x[["formVars"]] <- paste0(x[["formVars"]], collapse = ", ")
+      x
+    })))
     stop("The length of the list has not changed. Dead lock?")
   }
   lengthList <- length(calcList2)
@@ -616,9 +721,14 @@ for (i in 1:nrow(calcDf)) {
     script[length(script)] <- paste0(script[length(script)], addVal, " | ")
   }
   # Will be NULL if i is out of range.
-  if (addRightCellValueAsComment)
-    script[length(script)] <- paste0(script[length(script)], sheetList[[calcDf[i, "sheet"]]][calcDf[i, "row"], calcDf[i, "col"] + 1], " | ")
+  if (addRightCellValueAsComment) {
+    addVal <- sheetList[[calcDf[i, "sheet"]]][calcDf[i, "row"], calcDf[i, "col"] + 1]
+    if (length(addVal) == 0 || is.na(addVal))
+      addVal <- ""
+    script[length(script)] <- paste0(script[length(script)], addVal, " | ")
+  }
 
+  # Clean up unneccesary commentary "|" signs
   script[length(script)] <- gsub("|[| ]* *$", "", script[length(script)], fixed = FALSE)
   script[length(script)] <- trimws(script[length(script)])
 }
@@ -629,4 +739,8 @@ for (i in 1:nrow(calcDf)) {
   message("\n*** Script end ***")
 }
 writeLines(script, scriptOutFile, useBytes = TRUE)
+
+if (!is.null(logOutFile) && .keyValueStore$contains("log"))
+  writeLines(.keyValueStore$get("log"), logOutFile, useBytes = TRUE)
+
 
